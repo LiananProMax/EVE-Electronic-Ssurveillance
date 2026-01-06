@@ -1,0 +1,48 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Logs
+*.log
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# IDEs
+.vscode/
+.idea/
+*.iml
+
+# Cursor / tooling
+.cursor/
+
+# Local env files
+.env
+.env.*
+
+# EasyOCR / ML model caches (often downloaded to user profile, but keep safe)
+.EasyOCR/
+easyocr_model/
+models/
+
