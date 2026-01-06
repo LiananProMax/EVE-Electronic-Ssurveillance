@@ -3,7 +3,6 @@ import cv2
 import numpy as np
 import time
 import winsound
-import torch  
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PIL import ImageGrab
 import easyocr
@@ -117,7 +116,7 @@ class MainWindow(QtWidgets.QWidget):
         self.resize(560, 800)
         self.setMinimumSize(400, 600)
         self.screen_ratio = self.devicePixelRatio()
-        self.readers = {"CPU": None, "GPU": None}
+        self.readers = {"CPU": None}
         self.worker = Worker()
         self.worker.result_ready.connect(self.update_ui)
         
@@ -172,17 +171,11 @@ class MainWindow(QtWidgets.QWidget):
         control_group = QtWidgets.QHBoxLayout()
         control_group.setSpacing(10)
         
-        # 模式选择
-        self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItems(["标准模式 (CPU)", "加速模式 (GPU)"])
-        self.mode_combo.setFixedHeight(38)
-        
         # 预览开关按钮
         self.debug_btn = QtWidgets.QPushButton("实时预览")
         self.debug_btn.setCheckable(True)
         self.debug_btn.setFixedHeight(38)
         
-        control_group.addWidget(self.mode_combo, 2)
         control_group.addWidget(self.debug_btn, 1)
         self.main_layout.addLayout(control_group)
 
@@ -346,23 +339,16 @@ class MainWindow(QtWidgets.QWidget):
         """)
 
     def get_reader(self):
-        is_gpu = self.mode_combo.currentIndex() == 1
-        m_key = "GPU" if is_gpu else "CPU"
-        
-        if is_gpu and not torch.cuda.is_available():
-            self.log_output.appendPlainText("❌ 警告：CUDA 环境不可用。")
-            self.mode_combo.setCurrentIndex(0)
-            return self.get_reader()
-        
+        m_key = "CPU"
         if self.readers[m_key] is None:
-            self.log_output.appendPlainText(f"⏳ 正在加载 {m_key} 引擎...")
+            self.log_output.appendPlainText("⏳ 正在加载 CPU 引擎...")
             QtWidgets.QApplication.setOverrideCursor(QtGui.QCursor(QtCore.Qt.CursorShape.WaitCursor))
             try:
-                self.readers[m_key] = easyocr.Reader(['en'], gpu=is_gpu)
-                self.log_output.appendPlainText(f"✅ {m_key} 引擎已就绪。")
+                # 强制仅使用 CPU
+                self.readers[m_key] = easyocr.Reader(['en'], gpu=False)
+                self.log_output.appendPlainText("✅ CPU 引擎已就绪。")
             except Exception as e:
                 self.log_output.appendPlainText(f"❌ 加载失败：{e}")
-                self.mode_combo.setCurrentIndex(0)
             finally:
                 QtWidgets.QApplication.restoreOverrideCursor()
         return self.readers[m_key]
