@@ -8,10 +8,11 @@ from PyQt6 import QtWidgets, QtCore, QtGui
 from PIL import ImageGrab
 import easyocr
 
-# 强制禁用 opencv 的多线程，防止与 PyQt 冲突导致卡死
+# 强制禁用 opencv 的多线程，防止冲突
 cv2.setNumThreads(0)
 
 class Worker(QtCore.QThread):
+    # 信号：识别文字, 平均置信度, 预览图, 原始结果列表
     result_ready = QtCore.pyqtSignal(str, float, QtGui.QImage, list)
     
     def __init__(self):
@@ -49,12 +50,12 @@ class Worker(QtCore.QThread):
                             pos, text, conf = res[0], res[1], res[2]
                             w = abs(pos[1][0] - pos[0][0])
                             h = abs(pos[2][1] - pos[1][1])
-                            ratio = w / h if h > 0 else 0
+                            ratio = w / (h if h > 0 else 1)
                             
-                            # 过滤感叹号等窄条干扰
-                            if conf < 0.45 and ratio < 0.15: continue
+                            # 过滤干扰项
+                            if conf < 0.35 and ratio < 0.15: continue
                             
-                            if conf > 0.3:
+                            if conf > 0.25: # 降低一点点门槛，确保预览能看到
                                 all_nums.append(text)
                                 conf_sum += conf
                                 valid_results.append(res)
@@ -63,7 +64,8 @@ class Worker(QtCore.QThread):
                     display_text = "".join(all_nums) if all_nums else ""
                     avg_conf = conf_sum / len(valid_results) if valid_results else 0.0
                     
-                    qimg = self.process_debug_img(img_np, valid_results, should_alarm)
+                    # 核心改动：无论是否报警，都生成带有标注的图片
+                    qimg = self.process_debug_img(img_np, valid_results)
                     self.result_ready.emit(display_text, avg_conf, qimg, results)
                     
                     if should_alarm:
@@ -73,24 +75,45 @@ class Worker(QtCore.QThread):
             
             time.sleep(0.5)
 
-    def process_debug_img(self, img_np, results, triggered):
+    def process_debug_img(self, img_np, results):
+        """增强版绘图逻辑：在图片上画框并标注文字"""
         img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-        color = (0, 0, 255) if triggered else (0, 255, 0)
-        if self.show_debug and results:
+        
+        if results:
             for res in results:
+                # 还原坐标 (识别时放大了2倍)
                 pos = np.array(res[0], np.int32) // 2 
+                text = res[1]
+                conf = res[2]
+                
+                # 颜色判定：0 绿色，非 0 红色
+                color = (0, 0, 255) if text != "0" else (0, 255, 0)
+                
+                # 画矩形框
                 cv2.polylines(img_bgr, [pos], True, color, 2)
-                cv2.putText(img_bgr, res[1], (pos[0][0], pos[0][1] - 5), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                # 绘制文字标签背景 (黑色背景使白色文字更清晰)
+                label = f"{text} ({conf:.2f})"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.5
+                thickness = 1
+                (w, h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+                
+                # 文字位置 (框的左上角上方)
+                txt_x, txt_y = pos[0][0], max(pos[0][1] - 10, 20)
+                cv2.rectangle(img_bgr, (txt_x, txt_y - h - baseline), (txt_x + w, txt_y + baseline), (0, 0, 0), -1)
+                
+                # 写入标注文字
+                cv2.putText(img_bgr, label, (txt_x, txt_y), font, font_scale, (255, 255, 255), thickness)
+        
         h, w, ch = img_bgr.shape
         return QtGui.QImage(img_bgr.data, w, h, w * ch, QtGui.QImage.Format.Format_BGR888).copy()
 
 class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("数字监控报警 Pro (CUDA 加速版)")
+        self.setWindowTitle("数字监控报警 Pro (RTX 5090 适配版)")
         self.setFixedSize(500, 720)
-        
         self.screen_ratio = self.devicePixelRatio()
         self.readers = {"CPU": None, "GPU": None}
         self.worker = Worker()
@@ -105,7 +128,7 @@ class MainWindow(QtWidgets.QWidget):
         layout.addWidget(self.result_display)
 
         self.preview_label = QtWidgets.QLabel("预览窗口")
-        self.preview_label.setFixedSize(480, 160)
+        self.preview_label.setFixedSize(480, 200) # 稍微调高预览窗
         self.preview_label.setStyleSheet("border: 2px dashed #666; background: #333; color: #eee;")
         self.preview_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.preview_label)
@@ -113,7 +136,7 @@ class MainWindow(QtWidgets.QWidget):
         mode_layout = QtWidgets.QHBoxLayout()
         mode_layout.addWidget(QtWidgets.QLabel("运行模式:"))
         self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItems(["CPU 模式 (默认稳定)", "GPU 模式 (CUDA 加速)"])
+        self.mode_combo.addItems(["CPU 模式 (稳定)", "GPU 模式 (加速)"])
         mode_layout.addWidget(self.mode_combo)
         layout.addLayout(mode_layout)
 
@@ -125,7 +148,7 @@ class MainWindow(QtWidgets.QWidget):
         grid = QtWidgets.QGridLayout()
         self.select_btn = QtWidgets.QPushButton("🔍 1. 选取区域")
         self.monitor_btn = QtWidgets.QPushButton("▶ 2. 开始监控")
-        self.debug_btn = QtWidgets.QPushButton("🛠 开启预览")
+        self.debug_btn = QtWidgets.QPushButton("🛠 预览开关")
         self.debug_btn.setCheckable(True)
         self.print_btn = QtWidgets.QPushButton("📸 调试快照")
         
@@ -142,15 +165,14 @@ class MainWindow(QtWidgets.QWidget):
         m_key = "GPU" if is_gpu else "CPU"
         
         if is_gpu and not torch.cuda.is_available():
-            self.log_output.appendPlainText("❌ 警告：CUDA 环境不可用，切回 CPU。")
+            self.log_output.appendPlainText("❌ 警告：CUDA 环境不可用。")
             self.mode_combo.setCurrentIndex(0)
             return self.get_reader()
         
         if self.readers[m_key] is None:
-            self.log_output.appendPlainText(f"⏳ 正在加载 {m_key} 引擎...")
+            self.log_output.appendPlainText(f"⏳ 加载 {m_key} 引擎...")
             QtWidgets.QApplication.setOverrideCursor(QtGui.QCursor(QtCore.Qt.CursorShape.WaitCursor))
             try:
-                # 显式指定识别器
                 self.readers[m_key] = easyocr.Reader(['en'], gpu=is_gpu)
                 self.log_output.appendPlainText(f"✅ {m_key} 引擎就绪。")
             except Exception as e:
@@ -184,7 +206,7 @@ class MainWindow(QtWidgets.QWidget):
         x1, y1 = max(0, int(r.x()*ratio)-8), max(0, int(r.y()*ratio)-8)
         x2, y2 = int(r.right()*ratio)+8, int(r.bottom()*ratio)+8
         self.worker.target_rect = (x1, y1, x2, y2)
-        self.log_output.appendPlainText("🎯 监控区域已更新")
+        self.log_output.appendPlainText("🎯 区域已更新")
 
     def toggle_monitoring(self):
         if not self.worker.is_running:
@@ -194,11 +216,9 @@ class MainWindow(QtWidgets.QWidget):
             self.worker.is_running = True
             self.worker.start()
             self.monitor_btn.setText("⏹ 停止监控")
-            self.mode_combo.setEnabled(False)
         else:
             self.worker.is_running = False
             self.monitor_btn.setText("▶ 开始监控")
-            self.mode_combo.setEnabled(True)
 
     def manual_debug_print(self):
         res = self.worker._last_raw_results
@@ -209,17 +229,26 @@ class MainWindow(QtWidgets.QWidget):
                 self.log_output.appendPlainText(f"块[{i}]: '{it[1]}' (置信度:{it[2]:.4f})")
 
     def update_ui(self, text, conf, qimg, raw):
-        self.result_display.setText(text if text else "0")
-        color = "#00FF00" if (not text or text == "0") else "#FF0000"
+        # 更新状态文本和颜色
+        display_text = text if text else "0"
+        self.result_display.setText(display_text)
+        
+        # 判定报警变红
+        is_alert = any(c != '0' for c in text) if text else False
+        color = "#FF0000" if is_alert else "#00FF00"
         self.result_display.setStyleSheet(f"color: {color}; background: black; font-size: 50px; font-weight: bold; border-radius: 10px;")
+        
+        # 必须开启预览按钮才更新图片
         if self.debug_btn.isChecked():
-            self.preview_label.setPixmap(QtGui.QPixmap.fromImage(qimg).scaled(self.preview_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio))
+            self.preview_label.setPixmap(QtGui.QPixmap.fromImage(qimg).scaled(
+                self.preview_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio))
 
 if __name__ == "__main__":
-    # 修正 PyQt6 的 DPI 设置
-    app = QtWidgets.QApplication(sys.argv)
-    app.setHighDpiScaleFactorRoundingPolicy(QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    # 正确的 DPI 初始化顺序
+    QtWidgets.QApplication.setHighDpiScaleFactorRoundingPolicy(
+        QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     
+    app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
     win = MainWindow()
     win.show()
