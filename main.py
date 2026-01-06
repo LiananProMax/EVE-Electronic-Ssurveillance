@@ -113,7 +113,9 @@ class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("敌对中立监控程序")
-        self.setFixedSize(560, 800)
+        # 设置初始大小和最小大小，但允许用户调整窗口
+        self.resize(560, 800)
+        self.setMinimumSize(400, 600)
         self.screen_ratio = self.devicePixelRatio()
         self.readers = {"CPU": None, "GPU": None}
         self.worker = Worker()
@@ -122,6 +124,9 @@ class MainWindow(QtWidgets.QWidget):
         # 呼吸灯动画
         self.breathing_animation = None
         self.breathing_opacity = 1.0
+        
+        # 保存当前预览图像，用于窗口缩放时重新渲染
+        self.current_preview_image = None
         
         self.init_ui()
         self.apply_styles()
@@ -152,10 +157,16 @@ class MainWindow(QtWidgets.QWidget):
 
         # 2. 实时预览区
         self.preview_label = QtWidgets.QLabel("实时流已限制")
-        self.preview_label.setFixedSize(520, 240)
+        self.preview_label.setMinimumSize(400, 200)
         self.preview_label.setObjectName("PreviewWindow")
         self.preview_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.main_layout.addWidget(self.preview_label)
+        self.preview_label.setScaledContents(False)
+        # 设置大小策略：水平和垂直都可扩展
+        self.preview_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding, 
+            QtWidgets.QSizePolicy.Policy.Expanding
+        )
+        self.main_layout.addWidget(self.preview_label, 1)  # 添加拉伸因子
 
         # 3. 控制面板区 (并排布局)
         control_group = QtWidgets.QHBoxLayout()
@@ -198,7 +209,13 @@ class MainWindow(QtWidgets.QWidget):
         self.log_output = QtWidgets.QPlainTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setPlaceholderText("系统日志将显示在此...")
-        self.log_output.setMaximumHeight(150)
+        self.log_output.setMinimumHeight(100)
+        self.log_output.setMaximumHeight(200)
+        # 设置大小策略：可以垂直扩展
+        self.log_output.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding, 
+            QtWidgets.QSizePolicy.Policy.Expanding
+        )
         self.main_layout.addWidget(self.log_output)
 
         # 绑定事件
@@ -206,6 +223,17 @@ class MainWindow(QtWidgets.QWidget):
         self.monitor_btn.clicked.connect(self.toggle_monitoring)
         self.print_btn.clicked.connect(self.manual_debug_print)
 
+    def resizeEvent(self, event):
+        """窗口大小改变时的处理"""
+        super().resizeEvent(event)
+        # 如果有预览图片，重新缩放以适应新的窗口大小
+        if hasattr(self, 'current_preview_image') and self.current_preview_image is not None:
+            if self.debug_btn.isChecked():
+                self.preview_label.setPixmap(QtGui.QPixmap.fromImage(self.current_preview_image).scaled(
+                    self.preview_label.size(), 
+                    QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                    QtCore.Qt.TransformationMode.SmoothTransformation))
+    
     def apply_styles(self):
         """应用现代化深色主题样式"""
         self.setStyleSheet("""
@@ -465,6 +493,9 @@ class MainWindow(QtWidgets.QWidget):
             """)
             self.status_title.setText("系统扫描中")
             self.status_title.setStyleSheet("color: #00FFCC; font-size: 12px; letter-spacing: 2px;")
+        
+        # 保存当前的预览图像
+        self.current_preview_image = qimg
         
         # 必须开启预览按钮才更新图片
         if self.debug_btn.isChecked():
