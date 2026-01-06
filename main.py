@@ -112,53 +112,210 @@ class Worker(QtCore.QThread):
 class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("数字监控报警 Pro (RTX 5090 适配版)")
-        self.setFixedSize(500, 720)
+        self.setWindowTitle("敌对中立监控程序")
+        self.setFixedSize(560, 800)
         self.screen_ratio = self.devicePixelRatio()
         self.readers = {"CPU": None, "GPU": None}
         self.worker = Worker()
         self.worker.result_ready.connect(self.update_ui)
+        
+        # 呼吸灯动画
+        self.breathing_animation = None
+        self.breathing_opacity = 1.0
+        
         self.init_ui()
+        self.apply_styles()
 
     def init_ui(self):
-        layout = QtWidgets.QVBoxLayout(self)
-        self.result_display = QtWidgets.QLabel("等待开始")
+        # 主布局
+        self.main_layout = QtWidgets.QVBoxLayout(self)
+        self.main_layout.setSpacing(15)
+        self.main_layout.setContentsMargins(20, 20, 20, 20)
+
+        # 1. 核心数值显示区 (大卡片)
+        self.display_card = QtWidgets.QFrame()
+        self.display_card.setObjectName("DisplayCard")
+        display_layout = QtWidgets.QVBoxLayout(self.display_card)
+        display_layout.setContentsMargins(20, 15, 20, 15)
+        
+        self.status_title = QtWidgets.QLabel("系统就绪")
+        self.status_title.setStyleSheet("font-size: 12px; color: #888; letter-spacing: 2px;")
+        self.status_title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        
+        self.result_display = QtWidgets.QLabel("待机")
         self.result_display.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.result_display.setStyleSheet("font-size: 50px; font-weight: bold; color: #00FF00; background: black; border-radius: 10px; min-height: 120px;")
-        layout.addWidget(self.result_display)
+        self.result_display.setObjectName("BigNumber")
+        
+        display_layout.addWidget(self.status_title)
+        display_layout.addWidget(self.result_display)
+        self.main_layout.addWidget(self.display_card)
 
-        self.preview_label = QtWidgets.QLabel("预览窗口")
-        self.preview_label.setFixedSize(480, 200) # 稍微调高预览窗
-        self.preview_label.setStyleSheet("border: 2px dashed #666; background: #333; color: #eee;")
+        # 2. 实时预览区
+        self.preview_label = QtWidgets.QLabel("实时流已限制")
+        self.preview_label.setFixedSize(520, 240)
+        self.preview_label.setObjectName("PreviewWindow")
         self.preview_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.preview_label)
+        self.main_layout.addWidget(self.preview_label)
 
-        mode_layout = QtWidgets.QHBoxLayout()
-        mode_layout.addWidget(QtWidgets.QLabel("运行模式:"))
+        # 3. 控制面板区 (并排布局)
+        control_group = QtWidgets.QHBoxLayout()
+        control_group.setSpacing(10)
+        
+        # 模式选择
         self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItems(["CPU 模式 (稳定)", "GPU 模式 (加速)"])
-        mode_layout.addWidget(self.mode_combo)
-        layout.addLayout(mode_layout)
+        self.mode_combo.addItems(["标准模式 (CPU)", "加速模式 (GPU)"])
+        self.mode_combo.setFixedHeight(38)
+        
+        # 预览开关按钮
+        self.debug_btn = QtWidgets.QPushButton("实时预览")
+        self.debug_btn.setCheckable(True)
+        self.debug_btn.setFixedHeight(38)
+        
+        control_group.addWidget(self.mode_combo, 2)
+        control_group.addWidget(self.debug_btn, 1)
+        self.main_layout.addLayout(control_group)
 
+        # 4. 操作按钮区
+        btn_grid = QtWidgets.QGridLayout()
+        btn_grid.setSpacing(10)
+        
+        self.select_btn = QtWidgets.QPushButton("选择区域")
+        self.select_btn.setFixedHeight(42)
+        
+        self.print_btn = QtWidgets.QPushButton("调试快照")
+        self.print_btn.setFixedHeight(42)
+        
+        self.monitor_btn = QtWidgets.QPushButton("开始监控")
+        self.monitor_btn.setObjectName("PrimaryBtn")
+        self.monitor_btn.setFixedHeight(50)
+        
+        btn_grid.addWidget(self.select_btn, 0, 0)
+        btn_grid.addWidget(self.print_btn, 0, 1)
+        btn_grid.addWidget(self.monitor_btn, 1, 0, 1, 2) # 跨两列
+        self.main_layout.addLayout(btn_grid)
+
+        # 5. 日志区
         self.log_output = QtWidgets.QPlainTextEdit()
         self.log_output.setReadOnly(True)
-        self.log_output.setStyleSheet("background: #f8f8f8; font-family: Consolas;")
-        layout.addWidget(self.log_output)
+        self.log_output.setPlaceholderText("系统日志将显示在此...")
+        self.log_output.setMaximumHeight(150)
+        self.main_layout.addWidget(self.log_output)
 
-        grid = QtWidgets.QGridLayout()
-        self.select_btn = QtWidgets.QPushButton("🔍 1. 选取区域")
-        self.monitor_btn = QtWidgets.QPushButton("▶ 2. 开始监控")
-        self.debug_btn = QtWidgets.QPushButton("🛠 预览开关")
-        self.debug_btn.setCheckable(True)
-        self.print_btn = QtWidgets.QPushButton("📸 调试快照")
-        
-        grid.addWidget(self.select_btn, 0, 0); grid.addWidget(self.monitor_btn, 0, 1)
-        grid.addWidget(self.debug_btn, 1, 0); grid.addWidget(self.print_btn, 1, 1)
-        layout.addLayout(grid)
-
+        # 绑定事件
         self.select_btn.clicked.connect(self.start_selection)
         self.monitor_btn.clicked.connect(self.toggle_monitoring)
         self.print_btn.clicked.connect(self.manual_debug_print)
+
+    def apply_styles(self):
+        """应用现代化深色主题样式"""
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #1A1A1A;
+                color: #E0E0E0;
+                font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+            }
+            
+            #DisplayCard {
+                background-color: #252525;
+                border: 1px solid #333;
+                border-radius: 12px;
+            }
+            
+            #BigNumber {
+                font-size: 72px;
+                font-weight: 800;
+                color: #00FFCC;
+                background: transparent;
+                margin: 10px 0;
+            }
+            
+            #PreviewWindow {
+                background-color: #000;
+                border: 2px solid #333;
+                border-radius: 8px;
+                color: #555;
+                font-size: 13px;
+            }
+            
+            QPushButton {
+                background-color: #333;
+                border: none;
+                border-radius: 6px;
+                padding: 8px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            
+            QPushButton:hover {
+                background-color: #444;
+            }
+            
+            QPushButton:pressed {
+                background-color: #222;
+            }
+            
+            QPushButton:checked {
+                background-color: #0078D4;
+                color: white;
+            }
+            
+            #PrimaryBtn {
+                background-color: #0078D4;
+                font-size: 15px;
+                font-weight: bold;
+                margin-top: 5px;
+            }
+            
+            #PrimaryBtn:hover {
+                background-color: #2B88D8;
+            }
+            
+            #PrimaryBtn:pressed {
+                background-color: #005A9E;
+            }
+            
+            QComboBox {
+                background-color: #333;
+                border: 1px solid #444;
+                border-radius: 6px;
+                padding: 8px 10px;
+                font-size: 13px;
+            }
+            
+            QComboBox:hover {
+                border: 1px solid #555;
+            }
+            
+            QComboBox::drop-down {
+                border: none;
+                width: 30px;
+            }
+            
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid #E0E0E0;
+                margin-right: 8px;
+            }
+            
+            QComboBox QAbstractItemView {
+                background-color: #2A2A2A;
+                border: 1px solid #444;
+                selection-background-color: #0078D4;
+                outline: none;
+            }
+            
+            QPlainTextEdit {
+                background-color: #0F0F0F;
+                border: 1px solid #222;
+                border-radius: 6px;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 11px;
+                color: #888;
+                padding: 8px;
+            }
+        """)
 
     def get_reader(self):
         is_gpu = self.mode_combo.currentIndex() == 1
@@ -170,13 +327,13 @@ class MainWindow(QtWidgets.QWidget):
             return self.get_reader()
         
         if self.readers[m_key] is None:
-            self.log_output.appendPlainText(f"⏳ 加载 {m_key} 引擎...")
+            self.log_output.appendPlainText(f"⏳ 正在加载 {m_key} 引擎...")
             QtWidgets.QApplication.setOverrideCursor(QtGui.QCursor(QtCore.Qt.CursorShape.WaitCursor))
             try:
                 self.readers[m_key] = easyocr.Reader(['en'], gpu=is_gpu)
-                self.log_output.appendPlainText(f"✅ {m_key} 引擎就绪。")
+                self.log_output.appendPlainText(f"✅ {m_key} 引擎已就绪。")
             except Exception as e:
-                self.log_output.appendPlainText(f"❌ 加载失败: {e}")
+                self.log_output.appendPlainText(f"❌ 加载失败：{e}")
                 self.mode_combo.setCurrentIndex(0)
             finally:
                 QtWidgets.QApplication.restoreOverrideCursor()
@@ -206,7 +363,7 @@ class MainWindow(QtWidgets.QWidget):
         x1, y1 = max(0, int(r.x()*ratio)-8), max(0, int(r.y()*ratio)-8)
         x2, y2 = int(r.right()*ratio)+8, int(r.bottom()*ratio)+8
         self.worker.target_rect = (x1, y1, x2, y2)
-        self.log_output.appendPlainText("🎯 区域已更新")
+        self.log_output.appendPlainText(f"🎯 已选择区域：{x2-x1}x{y2-y1} 像素")
 
     def toggle_monitoring(self):
         if not self.worker.is_running:
@@ -215,33 +372,106 @@ class MainWindow(QtWidgets.QWidget):
             self.worker.reader = reader
             self.worker.is_running = True
             self.worker.start()
-            self.monitor_btn.setText("⏹ 停止监控")
+            self.monitor_btn.setText("停止监控")
+            self.monitor_btn.setStyleSheet("""
+                background-color: #CC3300;
+                font-size: 15px;
+                font-weight: bold;
+                margin-top: 5px;
+                border: none;
+                border-radius: 6px;
+            """)
+            self.start_breathing_animation()
         else:
             self.worker.is_running = False
-            self.monitor_btn.setText("▶ 开始监控")
+            self.monitor_btn.setText("开始监控")
+            self.monitor_btn.setStyleSheet("") # 恢复默认
+            self.stop_breathing_animation()
+
+    def start_breathing_animation(self):
+        """启动呼吸灯动画"""
+        self.breathing_animation = QtCore.QPropertyAnimation(self.monitor_btn, b"styleSheet")
+        self.breathing_animation.setDuration(2000)
+        self.breathing_animation.setLoopCount(-1) # 无限循环
+        
+        # 关键帧动画
+        self.breathing_animation.setKeyValueAt(0, """
+            background-color: #CC3300;
+            font-size: 15px;
+            font-weight: bold;
+            margin-top: 5px;
+            border: none;
+            border-radius: 6px;
+        """)
+        self.breathing_animation.setKeyValueAt(0.5, """
+            background-color: #FF4422;
+            font-size: 15px;
+            font-weight: bold;
+            margin-top: 5px;
+            border: none;
+            border-radius: 6px;
+        """)
+        self.breathing_animation.setKeyValueAt(1.0, """
+            background-color: #CC3300;
+            font-size: 15px;
+            font-weight: bold;
+            margin-top: 5px;
+            border: none;
+            border-radius: 6px;
+        """)
+        self.breathing_animation.start()
+    
+    def stop_breathing_animation(self):
+        """停止呼吸灯动画"""
+        if self.breathing_animation:
+            self.breathing_animation.stop()
+            self.breathing_animation = None
 
     def manual_debug_print(self):
         res = self.worker._last_raw_results
-        self.log_output.appendPlainText(f"\n--- 快照调试 ({time.strftime('%H:%M:%S')}) ---")
-        if not res: self.log_output.appendPlainText("无内容")
+        self.log_output.appendPlainText(f"\n--- Debug Snapshot ({time.strftime('%H:%M:%S')}) ---")
+        if not res: 
+            self.log_output.appendPlainText("未检测到内容。")
         else:
             for i, it in enumerate(res):
-                self.log_output.appendPlainText(f"块[{i}]: '{it[1]}' (置信度:{it[2]:.4f})")
+                self.log_output.appendPlainText(f"Block[{i}]: '{it[1]}' (conf: {it[2]:.4f})")
 
     def update_ui(self, text, conf, qimg, raw):
-        # 更新状态文本和颜色
+        # 更新状态文本
         display_text = text if text else "0"
         self.result_display.setText(display_text)
         
-        # 判定报警变红
+        # 判定报警状态
         is_alert = any(c != '0' for c in text) if text else False
-        color = "#FF0000" if is_alert else "#00FF00"
-        self.result_display.setStyleSheet(f"color: {color}; background: black; font-size: 50px; font-weight: bold; border-radius: 10px;")
+        
+        # 现代化的颜色切换：使用更亮的霓虹色
+        if is_alert:
+            self.result_display.setStyleSheet("""
+                color: #FF3366;
+                font-size: 72px;
+                font-weight: 800;
+                background: transparent;
+                margin: 10px 0;
+            """)
+            self.status_title.setText("⚠️  检测到警报")
+            self.status_title.setStyleSheet("color: #FF3366; font-size: 12px; letter-spacing: 2px;")
+        else:
+            self.result_display.setStyleSheet("""
+                color: #00FFCC;
+                font-size: 72px;
+                font-weight: 800;
+                background: transparent;
+                margin: 10px 0;
+            """)
+            self.status_title.setText("系统扫描中")
+            self.status_title.setStyleSheet("color: #00FFCC; font-size: 12px; letter-spacing: 2px;")
         
         # 必须开启预览按钮才更新图片
         if self.debug_btn.isChecked():
             self.preview_label.setPixmap(QtGui.QPixmap.fromImage(qimg).scaled(
-                self.preview_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio))
+                self.preview_label.size(), 
+                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation))
 
 if __name__ == "__main__":
     # 正确的 DPI 初始化顺序
