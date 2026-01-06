@@ -1,14 +1,51 @@
+import os
+
+# 尽早限制推理线程数：必须放在 onnxruntime / rapidocr 导入之前才更有效
+# 说明：用户仍可通过环境变量覆盖这些默认值
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
+
+try:
+    import onnxruntime as ort  # RapidOCR 底层依赖
+
+    # 关闭冗余日志，减少开销
+    ort.set_default_logger_severity(3)
+except Exception:
+    ort = None
+
 import sys
 import cv2
 import numpy as np
 import time
 import winsound
+from collections import defaultdict
 from PyQt6 import QtWidgets, QtCore, QtGui
-from PIL import ImageGrab
-import easyocr
+
+try:
+    import mss  # type: ignore
+
+    _HAS_MSS = True
+except Exception:
+    mss = None
+    _HAS_MSS = False
+
+try:
+    from PIL import ImageGrab
+
+    _HAS_IMAGEGRAB = True
+except Exception:
+    ImageGrab = None
+    _HAS_IMAGEGRAB = False
+
+from rapidocr_onnxruntime import RapidOCR
 
 # 强制禁用 opencv 的多线程，防止冲突
 cv2.setNumThreads(0)
+
+# 报警平均置信度阈值：要求达到 6.5/10（约 65%）才算有效
+ALARM_AVG_CONF_THRESHOLD = 0.65
 
 class Worker(QtCore.QThread):
     # 信号：识别文字, 平均置信度, 预览图, 原始结果列表
@@ -21,67 +58,213 @@ class Worker(QtCore.QThread):
         self.is_running = False
         self.show_debug = False
         self._last_raw_results = []
+        self._is_processing = False  # 防止并发重入，保证同一时间只有一个 OCR 任务
+        self._last_finish_ts = 0.0   # 上一次识别完成时间戳
+
+        # 截屏与性能配置
+        self._sct = None  # 在工作线程内创建，避免跨线程的 mss thread-local 问题
+        self.target_period_s = 2  # 目标约每 2 秒 1 帧（动态 sleep，会自动补偿处理耗时）
+
+        # 预处理参数：默认尽量省 CPU（需要更高准确率再调大）
+        self.ocr_scale = 1.0  # 1.0 = 不放大；可改成 1.5 等
+        self.auto_scale_if_small = True
+        self.auto_scale_min_width = 300
+        self.auto_scale_min_height = 120
+        self.auto_scale_value = 1.5
+        self.use_clahe = False
+        # 默认关闭直方图均衡化：彩色输入通常不需要，有时反而会破坏颜色信息
+        self.use_equalize_hist = False
 
     def run(self):
         if not self.reader: return
+        # mss 内部使用 thread-local 变量，必须在当前工作线程内初始化
+        if _HAS_MSS:
+            try:
+                # 避免复用旧线程创建的 mss 实例，重建以绑定当前线程
+                if self._sct and hasattr(self._sct, "close"):
+                    try: self._sct.close()
+                    except Exception: pass
+                self._sct = mss.mss()
+            except Exception as e:
+                print(f"初始化屏幕捕获失败，回退到 ImageGrab：{e}")
+                self._sct = None
         while self.is_running:
-            if self.target_rect:
-                try:
-                    # 1. 截图 (物理像素)
+            # 如果上一轮还在跑，或者距离上次完成不到 target_period_s，就等待
+            if self._is_processing:
+                time.sleep(0.02)
+                continue
+            
+            if self._last_finish_ts > 0:
+                remain = float(self.target_period_s) - (time.time() - self._last_finish_ts)
+                if remain > 0:
+                    time.sleep(min(remain, 0.05))
+                    continue
+
+            if not self.target_rect:
+                time.sleep(0.1)
+                continue
+
+            self._is_processing = True
+            loop_start = time.time()
+            try:
+                # 1. 截图 (物理像素)
+                x1, y1, x2, y2 = self.target_rect
+                w = max(1, int(x2 - x1))
+                h = max(1, int(y2 - y1))
+
+                if self._sct is not None:
+                    monitor = {"left": int(x1), "top": int(y1), "width": w, "height": h}
+                    shot = np.array(self._sct.grab(monitor))  # BGRA
+                    img_np = cv2.cvtColor(shot, cv2.COLOR_BGRA2RGB)
+                else:
+                    if not _HAS_IMAGEGRAB:
+                        raise RuntimeError("截屏库不可用：请安装 mss，或确保 Pillow 的 ImageGrab 可用")
                     img = ImageGrab.grab(bbox=self.target_rect, all_screens=True)
                     img_np = np.array(img)
-                    
-                    # 2. 图像增强预处理
-                    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-                    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-                    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-                    enhanced = clahe.apply(gray)
-                    _, thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                    
-                    # 3. OCR 识别
-                    results = self.reader.readtext(thresh, allowlist='0123456789')
-                    self._last_raw_results = results 
+                
+                # 2. 预处理：准备两种输入（彩色 + 灰度）
+                scale = float(self.ocr_scale)
+                if self.auto_scale_if_small and scale <= 1.0:
+                    if w < self.auto_scale_min_width or h < self.auto_scale_min_height:
+                        scale = float(self.auto_scale_value)
 
-                    all_nums, conf_sum, valid_results, should_alarm = [], 0, [], False
-                    
-                    if results:
-                        for res in results:
-                            pos, text, conf = res[0], res[1], res[2]
-                            w = abs(pos[1][0] - pos[0][0])
-                            h = abs(pos[2][1] - pos[1][1])
-                            ratio = w / (h if h > 0 else 1)
-                            
-                            # 过滤干扰项
-                            if conf < 0.35 and ratio < 0.15: continue
-                            
-                            if conf > 0.25: # 降低一点点门槛，确保预览能看到
-                                all_nums.append(text)
-                                conf_sum += conf
-                                valid_results.append(res)
-                                if text != "0": should_alarm = True
-                    
-                    display_text = "".join(all_nums) if all_nums else ""
-                    avg_conf = conf_sum / len(valid_results) if valid_results else 0.0
-                    
-                    # 核心改动：无论是否报警，都生成带有标注的图片
-                    qimg = self.process_debug_img(img_np, valid_results)
-                    self.result_ready.emit(display_text, avg_conf, qimg, results)
-                    
-                    if should_alarm:
-                        winsound.Beep(1000, 500)
-                except Exception as e:
-                    print(f"识别异常: {e}")
-            
-            time.sleep(0.5)
+                # 原彩色图（推荐用于游戏UI，对阴影/发光/抗锯齿效果更好）
+                color_for_ocr = img_np.copy()
+                if scale and abs(scale - 1.0) > 1e-3:
+                    color_for_ocr = cv2.resize(
+                        color_for_ocr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+                    )
 
-    def process_debug_img(self, img_np, results):
+                # 灰度增强图（备用）
+                gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+                if scale and abs(scale - 1.0) > 1e-3:
+                    gray_for_ocr = cv2.resize(
+                        gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+                    )
+                else:
+                    gray_for_ocr = gray
+
+                if self.use_clahe:
+                    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                    gray_enhanced = clahe.apply(gray_for_ocr)
+                elif self.use_equalize_hist:
+                    gray_enhanced = cv2.equalizeHist(gray_for_ocr)
+                else:
+                    gray_enhanced = gray_for_ocr
+                
+                # 3. 双路 OCR 识别：彩色优先，灰度补充
+                def ocr_extract_digits(img):
+                    """执行 OCR 并提取纯数字结果"""
+                    res, _ = self.reader(img)
+                    extracted = []
+                    if res:
+                        for item in res:
+                            if not isinstance(item, (list, tuple)) or len(item) < 3:
+                                continue
+                            box, text, conf = item[0], item[1], float(item[2])
+                            text = "".join(c for c in str(text) if c.isdigit())
+                            if text:
+                                extracted.append((box, text, conf))
+                    return extracted
+
+                # 彩色图 OCR（主要来源）
+                color_results = ocr_extract_digits(color_for_ocr)
+                
+                # 灰度图 OCR（补充来源）
+                gray_results = ocr_extract_digits(gray_enhanced)
+
+                # 合并结果：优先彩色，再补灰度（避免重复框）
+                def box_key(box):
+                    """生成框的唯一标识（基于中心位置，容差20像素）"""
+                    cx = int((box[0][0] + box[2][0]) / 2) // 20
+                    cy = int((box[0][1] + box[2][1]) / 2) // 20
+                    return (cx, cy)
+
+                seen_boxes = set()
+                results = []
+                
+                # 先添加彩色结果
+                for item in color_results:
+                    key = box_key(item[0])
+                    if key not in seen_boxes:
+                        seen_boxes.add(key)
+                        results.append(item)
+                
+                # 再添加灰度结果中的新框（置信度更高的情况）
+                for item in gray_results:
+                    key = box_key(item[0])
+                    if key not in seen_boxes:
+                        seen_boxes.add(key)
+                        results.append(item)
+
+                self._last_raw_results = results
+
+                conf_sum, valid_results = 0, []
+                detected_nonzero = False
+                
+                if results:
+                    for res in results:
+                        pos, text, conf = res[0], res[1], res[2]
+                        box_w = abs(pos[1][0] - pos[0][0])
+                        box_h = abs(pos[2][1] - pos[1][1])
+                        ratio = box_w / (box_h if box_h > 0 else 1)
+                        
+                        # 过滤干扰项
+                        if conf < 0.35 and ratio < 0.15: continue
+                        
+                        if conf > 0.25:  # 降低一点点门槛，确保预览能看到
+                            conf_sum += conf
+                            valid_results.append(res)
+                            if text != "0": detected_nonzero = True
+                
+                # 智能合并：按Y中心线分组，再按X排序合并
+                groups = defaultdict(list)
+                for res in valid_results:
+                    box = res[0]
+                    # 计算Y中心线，每 20 像素高度分一组
+                    center_y = int((box[0][1] + box[2][1]) / 2)
+                    group_key = center_y // 20
+                    groups[group_key].append(res)
+                
+                merged_nums = []
+                for group_key in sorted(groups.keys()):
+                    group = groups[group_key]
+                    # 按左上角X坐标排序
+                    group.sort(key=lambda r: r[0][0][0])
+                    line_text = "".join(r[1] for r in group)
+                    merged_nums.append(line_text)
+                
+                display_text = "".join(merged_nums)
+                avg_conf = conf_sum / len(valid_results) if valid_results else 0.0
+                should_alarm = detected_nonzero and (avg_conf >= ALARM_AVG_CONF_THRESHOLD)
+                
+                # 只有开启预览时才生成调试图，避免额外 CPU 开销
+                qimg = self.process_debug_img(img_np, valid_results, scale=scale) if self.show_debug else QtGui.QImage()
+                self.result_ready.emit(display_text, avg_conf, qimg, results)
+                
+                if should_alarm:
+                    winsound.Beep(1000, 500)
+            except Exception as e:
+                print(f"识别异常: {e}")
+            finally:
+                self._is_processing = False
+                self._last_finish_ts = time.time()
+
+            # 确保线程在极短处理耗时场景下也不会忙轮询
+            if time.time() - loop_start < 0.01:
+                time.sleep(0.01)
+
+    def process_debug_img(self, img_np, results, scale: float = 1.0):
         """增强版绘图逻辑：在图片上画框并标注文字"""
         img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
         
         if results:
             for res in results:
-                # 还原坐标 (识别时放大了2倍)
-                pos = np.array(res[0], np.int32) // 2 
+                # 还原坐标：识别时可能放大了 scale 倍
+                pos = np.array(res[0], np.float32)
+                if scale and abs(scale - 1.0) > 1e-3:
+                    pos = pos / float(scale)
+                pos = pos.astype(np.int32)
                 text = res[1]
                 conf = res[2]
                 
@@ -313,6 +496,11 @@ class MainWindow(QtWidgets.QWidget):
         self.select_btn.clicked.connect(self.start_selection)
         self.monitor_btn.clicked.connect(self.toggle_monitoring)
         self.print_btn.clicked.connect(self.manual_debug_print)
+        self.debug_btn.toggled.connect(self.on_debug_toggled)
+
+    def on_debug_toggled(self, checked: bool):
+        self.debug_btn.setText("关闭" if checked else "开启")
+        self.worker.show_debug = bool(checked)
 
     def resizeEvent(self, event):
         """窗口大小改变时的处理"""
@@ -586,12 +774,43 @@ class MainWindow(QtWidgets.QWidget):
     def get_reader(self):
         m_key = "CPU"
         if self.readers[m_key] is None:
-            self.log_output.appendPlainText("⏳ 正在加载 CPU 引擎...")
+            self.log_output.appendPlainText("⏳ 正在加载 RapidOCR 引擎...")
             QtWidgets.QApplication.setOverrideCursor(QtGui.QCursor(QtCore.Qt.CursorShape.WaitCursor))
             try:
-                # 强制仅使用 CPU
-                self.readers[m_key] = easyocr.Reader(['en'], gpu=False)
-                self.log_output.appendPlainText("✅ CPU 引擎已就绪。")
+                # 更精细的 ONNX Runtime 线程控制
+                intra_threads = 2  # 单算子内部线程
+                inter_threads = 2  # 算子间线程
+                
+                # 创建优化后的 SessionOptions
+                sess_opts = None
+                if ort is not None:
+                    sess_opts = ort.SessionOptions()
+                    sess_opts.intra_op_num_threads = intra_threads
+                    sess_opts.inter_op_num_threads = inter_threads
+                    sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                
+                # RapidOCR 初始化：强制 CPU 并应用线程控制
+                # 注意：RapidOCR 1.x 版本通过构造函数参数控制
+                self.readers[m_key] = RapidOCR(
+                    det_use_cuda=False,
+                    cls_use_cuda=False,
+                    rec_use_cuda=False,
+                    # 线程控制参数（RapidOCR >= 1.3 支持）
+                    intra_op_num_threads=intra_threads,
+                    inter_op_num_threads=inter_threads,
+                )
+                self.log_output.appendPlainText(f"✅ RapidOCR 引擎已就绪（CPU，线程限制: {intra_threads}）。")
+            except TypeError:
+                # 如果 RapidOCR 版本不支持线程参数，回退到基础初始化
+                try:
+                    self.readers[m_key] = RapidOCR(
+                        det_use_cuda=False,
+                        cls_use_cuda=False,
+                        rec_use_cuda=False,
+                    )
+                    self.log_output.appendPlainText("✅ RapidOCR 引擎已就绪（CPU，环境变量线程控制）。")
+                except Exception as e2:
+                    self.log_output.appendPlainText(f"❌ 加载失败：{e2}")
             except Exception as e:
                 self.log_output.appendPlainText(f"❌ 加载失败：{e}")
             finally:
@@ -642,6 +861,15 @@ class MainWindow(QtWidgets.QWidget):
             self.start_breathing_animation()
         else:
             self.worker.is_running = False
+            
+            # 清理 mss 资源，释放系统句柄
+            if self.worker._sct is not None:
+                try:
+                    self.worker._sct.close()
+                except Exception:
+                    pass
+                self.worker._sct = None
+            
             self.monitor_btn.setText("开始监控")
             self.monitor_btn.setProperty("state", "idle")
             self.monitor_btn.style().unpolish(self.monitor_btn)
@@ -702,7 +930,7 @@ class MainWindow(QtWidgets.QWidget):
         self.conf_label.setText(f"平均置信度 {conf:.0%}" if conf > 0 else "平均置信度 --")
         
         # 判定报警状态
-        is_alert = any(c != '0' for c in text) if text else False
+        is_alert = (conf >= ALARM_AVG_CONF_THRESHOLD) and (any(c != '0' for c in text) if text else False)
 
         # 用属性驱动 QSS，避免 setStyleSheet 覆盖全局主题
         self.result_display.setProperty("alert", "true" if is_alert else "false")
