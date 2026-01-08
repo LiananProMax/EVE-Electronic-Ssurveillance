@@ -159,7 +159,8 @@ class MainWindow(QtWidgets.QWidget):
         preview_card_layout.addLayout(preview_head)
 
         self.preview_label = QtWidgets.QLabel("实时流已限制")
-        self.preview_label.setMinimumSize(360, 220)
+        # 减小最小尺寸，防止在小窗口下预览区无法缩放导致显示不全（原为 360, 220）
+        self.preview_label.setMinimumSize(100, 60)
         self.preview_label.setObjectName("PreviewWindow")
         self.preview_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setScaledContents(False)
