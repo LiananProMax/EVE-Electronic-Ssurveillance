@@ -10,6 +10,8 @@ from ..ocr.rapidocr_engine import create_rapidocr_engine
 from ..worker import Worker
 from .selection_overlay import AreaSelectionOverlay
 from .styles import MAIN_STYLESHEET
+from .window_picker import pick_window
+from ..win.window_api import activate_window, get_window_rect_dips, get_window_title, is_window
 
 
 class MainWindow(QtWidgets.QWidget):
@@ -28,6 +30,11 @@ class MainWindow(QtWidgets.QWidget):
         self.worker = Worker()
         self.worker.result_ready.connect(self.update_ui)
 
+        # 窗口选择模式：先选窗口(hwnd)，再在窗口内拖拽选区域（区域使用归一化坐标存储）
+        self._target_hwnd: Optional[int] = None
+        self._target_window_title: str = ""
+        self._target_window_rect_global: Optional[QtCore.QRect] = None
+
         # 呼吸灯动画
         self.breathing_animation = None
         self.breathing_opacity = 1.0
@@ -38,6 +45,8 @@ class MainWindow(QtWidgets.QWidget):
 
         self.init_ui()
         self.apply_styles()
+        # Worker 线程日志输出到 UI
+        self.worker.log_ready.connect(self.log_output.appendPlainText)
 
     def init_ui(self) -> None:
         def add_shadow(w: QtWidgets.QWidget, blur: int = 28, y: int = 10, alpha: int = 26) -> None:
@@ -172,7 +181,7 @@ class MainWindow(QtWidgets.QWidget):
 
         action_title = QtWidgets.QLabel("控制面板")
         action_title.setObjectName("CardTitle")
-        action_sub = QtWidgets.QLabel("选择区域后开始监控")
+        action_sub = QtWidgets.QLabel("先选择窗口并框选区域，再开始监控（窗口可被遮挡）")
         action_sub.setObjectName("CardHint")
         action_layout.addWidget(action_title)
         action_layout.addWidget(action_sub)
@@ -270,17 +279,75 @@ class MainWindow(QtWidgets.QWidget):
         return self.readers[m_key]
 
     def start_selection(self) -> None:
-        self.cw = AreaSelectionOverlay()
+        # 新流程：先选择窗口，再在窗口内框选（窗口被遮挡也能继续监控）
+        win = pick_window(self)
+        if win is None:
+            return
+
+        hwnd = int(win.hwnd)
+        title = (win.title or "").strip() or get_window_title(hwnd) or f"0x{hwnd:08X}"
+        if not is_window(hwnd):
+            self.log_output.appendPlainText("⚠️ 目标窗口不存在或已关闭，请重新选择。")
+            return
+
+        self._target_hwnd = hwnd
+        self._target_window_title = title
+        self.log_output.appendPlainText(f"🪟 已选择窗口：{title}")
+
+        # 尽力置前方便用户框选；后续监控不要求置前
+        activate_window(hwnd)
+
+        l, t, r, b = get_window_rect_dips(hwnd)
+        allowed = QtCore.QRect(int(l), int(t), max(1, int(r - l)), max(1, int(b - t)))
+        self._target_window_rect_global = allowed
+
+        hint = f"窗口：{title}\n在该窗口内拖拽选择监控区域（ESC 取消）"
+        self.cw = AreaSelectionOverlay(allowed_rect=allowed, hint_text=hint)
         self.cw.selection_made.connect(self.on_area)
-        # 维持与旧实现一致：最大化 + 半透明覆盖
-        self.cw.setWindowState(QtCore.Qt.WindowState.WindowMaximized)
         self.cw.show()
 
     def on_area(self, r: QtCore.QRect) -> None:
+        # 1) 窗口模式：将选区转成相对窗口的归一化坐标（0~1），避免 DPI/遮挡问题
+        if self._target_hwnd is not None and self._target_window_rect_global is not None:
+            allowed = self._target_window_rect_global
+            rr = r.intersected(allowed)
+            if rr.isNull() or rr.width() <= 5 or rr.height() <= 5:
+                self.log_output.appendPlainText("⚠️ 选择区域太小，请重试。")
+                return
+
+            # 使用右下角“开区间”端点，避免 QRect.right 的包含语义带来 1px 误差
+            ax, ay, aw, ah = allowed.x(), allowed.y(), max(1, allowed.width()), max(1, allowed.height())
+            x1 = float(rr.x() - ax) / float(aw)
+            y1 = float(rr.y() - ay) / float(ah)
+            x2 = float(rr.x() + rr.width() - ax) / float(aw)
+            y2 = float(rr.y() + rr.height() - ay) / float(ah)
+
+            # clamp
+            x1 = min(max(x1, 0.0), 1.0)
+            y1 = min(max(y1, 0.0), 1.0)
+            x2 = min(max(x2, 0.0), 1.0)
+            y2 = min(max(y2, 0.0), 1.0)
+            if x2 - x1 <= 0.002 or y2 - y1 <= 0.002:
+                self.log_output.appendPlainText("⚠️ 选择区域太小，请重试。")
+                return
+
+            self.worker.target_hwnd = int(self._target_hwnd)
+            self.worker.target_norm_rect = (x1, y1, x2, y2)
+            # 关闭旧的屏幕区域模式，避免混淆
+            self.worker.target_rect = None
+
+            self.log_output.appendPlainText(
+                f"🎯 已选择窗口区域：{self._target_window_title}  ({(x2 - x1):.1%} x {(y2 - y1):.1%})"
+            )
+            return
+
+        # 2) 旧屏幕模式（兜底）：全屏框选 -> 屏幕像素坐标
         ratio = self.screen_ratio
         x1, y1 = max(0, int(r.x() * ratio) - 8), max(0, int(r.y() * ratio) - 8)
-        x2, y2 = int(r.right() * ratio) + 8, int(r.bottom() * ratio) + 8
+        x2, y2 = int((r.x() + r.width()) * ratio) + 8, int((r.y() + r.height()) * ratio) + 8
         self.worker.target_rect = (x1, y1, x2, y2)
+        self.worker.target_hwnd = None
+        self.worker.target_norm_rect = None
         self.log_output.appendPlainText(f"🎯 已选择区域：{x2 - x1}x{y2 - y1} 像素")
 
     def toggle_monitoring(self) -> None:

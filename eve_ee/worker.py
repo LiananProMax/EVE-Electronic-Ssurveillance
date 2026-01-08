@@ -9,6 +9,7 @@ import numpy as np
 from PyQt6 import QtCore, QtGui
 
 from .capture.screen_capture import ScreenCapture
+from .win.window_api import capture_window_rgb, is_window
 from .constants import (
     ALARM_AVG_CONF_THRESHOLD,
     AUTO_SCALE_IF_SMALL,
@@ -32,16 +33,23 @@ class Worker(QtCore.QThread):
 
     # 信号：识别文字, 平均置信度, 预览图, 原始结果列表
     result_ready = QtCore.pyqtSignal(str, float, QtGui.QImage, list)
+    # 信号：日志文本（用于在 UI 的日志框显示错误/提示）
+    log_ready = QtCore.pyqtSignal(str)
 
     def __init__(self) -> None:
         super().__init__()
         self.reader = None
         self.target_rect = None
+        # 窗口模式：按 hwnd 抓窗口，再用归一化坐标裁剪 ROI
+        self.target_hwnd: Optional[int] = None
+        self.target_norm_rect: Optional[tuple[float, float, float, float]] = None
         self.is_running = False
         self.show_debug = False
         self._last_raw_results: list = []
         self._is_processing = False  # 防止并发重入，保证同一时间只有一个 OCR 任务
         self._last_finish_ts = 0.0  # 上一次识别完成时间戳
+        self._last_error_msg = ""
+        self._last_error_emit_ts = 0.0
 
         # 截屏与性能配置
         self._capture: Optional[ScreenCapture] = None  # 在工作线程内创建，避免跨线程的 thread-local 问题
@@ -90,20 +98,55 @@ class Worker(QtCore.QThread):
                         continue
 
                 if not self.target_rect:
-                    time.sleep(0.1)
-                    continue
+                    # 新窗口模式也允许触发
+                    if not (self.target_hwnd is not None and self.target_norm_rect is not None):
+                        time.sleep(0.1)
+                        continue
 
                 self._is_processing = True
                 loop_start = time.time()
                 try:
                     # 1. 截图 (物理像素)
-                    x1, y1, x2, y2 = self.target_rect
-                    w = max(1, int(x2 - x1))
-                    h = max(1, int(y2 - y1))
+                    # - 屏幕模式：直接抓屏幕 ROI
+                    # - 窗口模式：抓取整窗（支持遮挡），再按归一化坐标裁剪 ROI
+                    if self.target_hwnd is not None and self.target_norm_rect is not None:
+                        hwnd = int(self.target_hwnd)
+                        if not is_window(hwnd):
+                            raise RuntimeError("目标窗口不存在或已关闭")
 
-                    if self._capture is None:
-                        raise RuntimeError("截屏器未初始化")
-                    img_np = self._capture.grab_rgb(self.target_rect)  # RGB
+                        full = capture_window_rgb(hwnd)  # RGB
+                        H, W = full.shape[:2]
+                        nx1, ny1, nx2, ny2 = self.target_norm_rect
+                        # clamp 防御
+                        nx1 = min(max(float(nx1), 0.0), 1.0)
+                        ny1 = min(max(float(ny1), 0.0), 1.0)
+                        nx2 = min(max(float(nx2), 0.0), 1.0)
+                        ny2 = min(max(float(ny2), 0.0), 1.0)
+
+                        x1 = int(nx1 * W)
+                        y1 = int(ny1 * H)
+                        x2 = int(nx2 * W)
+                        y2 = int(ny2 * H)
+
+                        # 留一点 padding，减少边缘抖动导致漏字
+                        pad = 8
+                        x1 = max(0, x1 - pad)
+                        y1 = max(0, y1 - pad)
+                        x2 = min(W, x2 + pad)
+                        y2 = min(H, y2 + pad)
+
+                        w = max(1, int(x2 - x1))
+                        h = max(1, int(y2 - y1))
+                        img_np = full[y1:y2, x1:x2].copy()
+                    else:
+                        if self._capture is None:
+                            raise RuntimeError("截屏器未初始化")
+                        if not self.target_rect:
+                            raise RuntimeError("未设置目标区域")
+                        x1, y1, x2, y2 = self.target_rect
+                        w = max(1, int(x2 - x1))
+                        h = max(1, int(y2 - y1))
+                        img_np = self._capture.grab_rgb(self.target_rect)  # RGB
 
                     # 2. 预处理：准备两种输入（彩色 + 灰度）
                     scale = float(self.ocr_scale)
@@ -233,7 +276,17 @@ class Worker(QtCore.QThread):
                     if should_alarm and winsound is not None:
                         winsound.Beep(1000, 500)
                 except Exception as e:
-                    print(f"识别异常: {e}")
+                    msg = f"❌ 识别异常：{e}"
+                    print(msg)
+                    now = time.time()
+                    # 避免同一错误刷屏（默认每 5 秒最多推送一次）
+                    if msg != self._last_error_msg or (now - self._last_error_emit_ts) > 5.0:
+                        self._last_error_msg = msg
+                        self._last_error_emit_ts = now
+                        try:
+                            self.log_ready.emit(msg)
+                        except Exception:
+                            pass
                 finally:
                     self._is_processing = False
                     self._last_finish_ts = time.time()
